@@ -35,8 +35,12 @@ In both modes a 1-bit stencil /Mask is emitted for fully-transparent pixels
 and text -- shows through untouched; only the soft fringe is ever baked.
 
 Scope / limitations (documented honestly):
-  * Handles image /SMask soft masks (the Illustrator / Scribus / Photoshop
-    case). Soft masks set in the graphics state via `gs` are NOT handled.
+  * Images drawn inside form XObjects (some software nests everything in
+    forms) are caught by a final sweep and flattened in isolation over the flat
+    --bg colour, regardless of nesting depth or reuse across pages. Their
+    opaque core and silhouette are exact; only the soft fringe is composited
+    over --bg rather than the actual local backdrop. Top-level page-content
+    images still get the full placement-aware backdrop treatment.
   * Axis-aligned, flipped, rotated and skewed placement are all supported:
     the backdrop is sampled through the image's affine transform. Only
     degenerate (zero-area) placements are skipped.
@@ -70,7 +74,7 @@ import tempfile
 import zlib
 
 import pikepdf
-from pikepdf import Name, Operator, ContentStreamInstruction
+from pikepdf import Name, Operator, ContentStreamInstruction, Dictionary, Stream
 from PIL import Image, ImageCms
 
 Image.MAX_IMAGE_PIXELS = None  # large print images are expected
@@ -348,6 +352,73 @@ def make_rgb_to_cmyk(icc_path):
 # ----------------------------------------------------------------------------
 # Main per-image flatten
 # ----------------------------------------------------------------------------
+def _write_opaque_image(pdf, xobj, out_img, alpha_arr, ncomp, no_stencil):
+    """Write composited opaque pixels back into an image XObject, add a 1-bit
+    stencil for fully-transparent pixels, and strip transparency keys."""
+    import numpy as np
+    raw = out_img.tobytes()
+    xobj.write(zlib.compress(raw, 6), filter=Name.FlateDecode)
+    xobj.Width = out_img.width
+    xobj.Height = out_img.height
+    xobj.BitsPerComponent = 8
+    stencil = None
+    if not no_stencil and bool((alpha_arr == 0).any()):
+        masked = (alpha_arr == 0).astype(np.uint8)
+        packed = np.packbits(masked, axis=1)
+        stencil = pdf.make_stream(b"")
+        stencil.write(zlib.compress(packed.tobytes(), 6), filter=Name.FlateDecode)
+        stencil.Type = Name.XObject
+        stencil.Subtype = Name.Image
+        stencil.Width = out_img.width
+        stencil.Height = out_img.height
+        stencil.ImageMask = True
+        stencil.BitsPerComponent = 1
+    if xobj.get("/ColorSpace") is None:
+        xobj.ColorSpace = {4: Name.DeviceCMYK, 3: Name.DeviceRGB,
+                           1: Name.DeviceGray}[ncomp]
+    for k in ("/SMask", "/Mask", "/Decode", "/Matte", "/SMaskInData"):
+        if k in xobj:
+            del xobj[k]
+    if stencil is not None:
+        xobj.Mask = stencil
+
+
+def _bg_tuple(work, bg):
+    bgi = [int(round(x)) for x in bg] if bg else None
+    if work == "CMYK":
+        return tuple(bgi) if bgi else (0, 0, 0, 0)
+    if work == "RGB":
+        return tuple(bgi) if bgi else (255, 255, 255)
+    return (bgi[0] if bgi else 255)
+
+
+def flatten_isolated(pdf, xobj, bg, no_stencil):
+    """Flatten one soft-masked image XObject in isolation: composite it over a
+    flat background colour (with a 1-bit stencil for the fully-transparent
+    pixels) and remove /SMask. Placement-independent, so it works no matter how
+    deeply the image is nested in form XObjects and is safe for images reused on
+    several pages. The opaque core and the cut-out silhouette are exact; only
+    the soft fringe is composited over the flat background."""
+    import numpy as np
+    fg = pikepdf.PdfImage(xobj).as_pil_image()
+    if fg.mode == "CMYK":
+        work, ncomp = "CMYK", 4
+    elif fg.mode == "RGB":
+        work, ncomp = "RGB", 3
+    elif fg.mode == "L":
+        work, ncomp = "L", 1
+    else:
+        fg = fg.convert("RGB")
+        work, ncomp = "RGB", 3
+    alpha = pikepdf.PdfImage(xobj.SMask).as_pil_image().convert("L")
+    if alpha.size != fg.size:
+        alpha = alpha.resize(fg.size, Image.LANCZOS)
+    canvas = Image.new(work, fg.size, _bg_tuple(work, bg))
+    out_img = Image.composite(fg, canvas, alpha)
+    _write_opaque_image(pdf, xobj, out_img, np.asarray(alpha), ncomp, no_stencil)
+    return fg.size, work
+
+
 def flatten(in_path, out_path, icc_path=None, maxdpi=1200.0, no_stencil=False,
             backdrop_mode="image", bg=None, verbose=True):
     rgb_to_cmyk = make_rgb_to_cmyk(icc_path)
@@ -477,6 +548,41 @@ def flatten(in_path, out_path, icc_path=None, maxdpi=1200.0, no_stencil=False,
             report.append(f"  page {page_index+1}: flattened {t.name} "
                           f"({fg_w}x{fg_h}, {mode}"
                           f"{', rotated/skewed' if rotated else ''})")
+
+    # Catch-all sweep: any soft-masked image XObject the page-content pass did
+    # not reach -- typically images drawn INSIDE form XObjects (some software
+    # nests all content in forms) -- is flattened in isolation here. The
+    # page-content pass already removed /SMask from what it handled, so this
+    # only sees the leftovers. De-duplicated by object, so an image reused on
+    # several pages is flattened once.
+    leftovers = []
+    seen = set()
+    for o in pdf.objects:
+        if not isinstance(o, (Dictionary, Stream)):
+            continue
+        if str(o.get("/Subtype")) != "/Image":
+            continue
+        sm = o.get("/SMask")
+        if sm is None or str(sm) == "/None":
+            continue
+        if o.objgen in seen:
+            continue
+        seen.add(o.objgen)
+        leftovers.append(o.objgen)
+
+    swept = 0
+    for og in leftovers:
+        xobj = pdf.get_object(og)
+        try:
+            size, work = flatten_isolated(pdf, xobj, bg, no_stencil)
+            swept += 1
+            total_flattened += 1
+            report.append(f"  sweep: flattened nested/other image {og} "
+                          f"({size[0]}x{size[1]}, {work}, isolated)")
+        except Exception as ex:
+            report.append(f"  sweep: skipped image {og} ({ex})")
+    if swept:
+        report.append(f"  sweep flattened {swept} soft-masked image(s) not in page content")
 
     # PDF 1.3 has no live transparency; advertise that level on output.
     pdf.save(out_path, min_version="1.3")
