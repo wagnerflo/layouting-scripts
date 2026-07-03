@@ -80,6 +80,26 @@ from PIL import Image, ImageCms
 Image.MAX_IMAGE_PIXELS = None  # large print images are expected
 
 
+def read_input_bytes(path):
+    """Read a PDF into bytes from a file, or from stdin when path is '-'."""
+    if path == "-":
+        return sys.stdin.buffer.read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def save_pdf(pdf, path, **save_kwargs):
+    """Save to a file, or to stdout when path is '-' (buffered so it works on
+    non-seekable pipes)."""
+    if path == "-":
+        buf = io.BytesIO()
+        pdf.save(buf, **save_kwargs)
+        sys.stdout.buffer.write(buf.getvalue())
+        sys.stdout.buffer.flush()
+    else:
+        pdf.save(path, **save_kwargs)
+
+
 # ----------------------------------------------------------------------------
 # 3x3 affine matrix helpers (PDF row-vector convention)
 #   matrix = (a, b, c, d, e, f)  ->  [x' y'] = [x y 1] * [[a b 0],[c d 0],[e f 1]]
@@ -256,18 +276,19 @@ def q_depth(instructions):
     return max(d, 0)
 
 
-def render_backdrop(src_path, page_index, prefix, mediabox, ctm, fg_w, fg_h, maxdpi):
+def render_backdrop(src_bytes, page_index, prefix, mediabox, ctm, fg_w, fg_h, maxdpi):
     """Render `prefix` (the content beneath the target image) and resample it
     into the image's OWN pixel grid, following the image's affine placement
     `ctm`. This handles axis-aligned, flipped, rotated and skewed placement
     uniformly, because we sample the backdrop through the exact transform that
     maps each image pixel to device space.
+    `src_bytes` is the original PDF as bytes (so this works with stdin input).
     Returns an RGB PIL image of size (fg_w, fg_h)."""
     # Rebalance graphics state so the truncated stream is well-formed.
     prefix = list(prefix) + [ContentStreamInstruction([], Operator("Q"))] * q_depth(prefix)
     data = pikepdf.unparse_content_stream(prefix)
 
-    pdf = pikepdf.open(src_path)
+    pdf = pikepdf.open(io.BytesIO(src_bytes))
     page = pdf.pages[page_index]
     page.Contents = pdf.make_stream(data)
     tmp = tempfile.mktemp(suffix=".pdf")
@@ -422,7 +443,8 @@ def flatten_isolated(pdf, xobj, bg, no_stencil):
 def flatten(in_path, out_path, icc_path=None, maxdpi=1200.0, no_stencil=False,
             backdrop_mode="image", bg=None, verbose=True):
     rgb_to_cmyk = make_rgb_to_cmyk(icc_path)
-    pdf = pikepdf.open(in_path)
+    src_bytes = read_input_bytes(in_path)
+    pdf = pikepdf.open(io.BytesIO(src_bytes))
     total_flattened = 0
     report = []
 
@@ -497,7 +519,7 @@ def flatten(in_path, out_path, icc_path=None, maxdpi=1200.0, no_stencil=False,
                 # Render-based backdrop (captures vector/gradient/text), but
                 # CMYK goes through an RGB round-trip.
                 prefix = instructions[: t.index]
-                backdrop = render_backdrop(in_path, page_index, prefix, mediabox,
+                backdrop = render_backdrop(src_bytes, page_index, prefix, mediabox,
                                            t.ctm, fg_w, fg_h, maxdpi)
                 if work == "CMYK":
                     out_img = Image.composite(fg, rgb_to_cmyk(backdrop), alpha)
@@ -585,20 +607,22 @@ def flatten(in_path, out_path, icc_path=None, maxdpi=1200.0, no_stencil=False,
         report.append(f"  sweep flattened {swept} soft-masked image(s) not in page content")
 
     # PDF 1.3 has no live transparency; advertise that level on output.
-    pdf.save(out_path, min_version="1.3")
+    save_pdf(pdf, out_path, min_version="1.3")
     pdf.close()
 
     if verbose:
-        print(f"Flattened {total_flattened} soft-masked image(s).")
+        # When the PDF goes to stdout, log to stderr so it doesn't corrupt it.
+        log = sys.stderr if out_path == "-" else sys.stdout
+        print(f"Flattened {total_flattened} soft-masked image(s).", file=log)
         for line in report:
-            print(line)
+            print(line, file=log)
     return total_flattened
 
 
 def main():
     ap = argparse.ArgumentParser(description="Flatten soft-masked images in a PDF.")
-    ap.add_argument("input")
-    ap.add_argument("output")
+    ap.add_argument("input", help="input PDF, or - for stdin")
+    ap.add_argument("output", help="output PDF, or - for stdout")
     ap.add_argument("--backdrop", choices=["image", "render"], default="image",
                     help="'image' (default): native-colour-space compositing of "
                          "the lower images, no conversion. 'render': rasterise "

@@ -30,11 +30,32 @@ Usage:
     python3 finalize_pdfx.py in.pdf out.pdf --target x3 [--year 2002|2003]
 """
 import argparse
+import io
 import re
+import sys
 import pikepdf
 from pikepdf import Name, Array, Dictionary, Stream, String
 
 ICC_TO_DEV = {1: Name.DeviceGray, 3: Name.DeviceRGB, 4: Name.DeviceCMYK}
+
+
+def read_input_bytes(path):
+    """Read a PDF into bytes from a file, or from stdin when path is '-'."""
+    if path == "-":
+        return sys.stdin.buffer.read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def save_pdf(pdf, path, **save_kwargs):
+    """Save to a file, or to stdout when path is '-' (buffered for pipes)."""
+    if path == "-":
+        buf = io.BytesIO()
+        pdf.save(buf, **save_kwargs)
+        sys.stdout.buffer.write(buf.getvalue())
+        sys.stdout.buffer.flush()
+    else:
+        pdf.save(path, **save_kwargs)
 
 
 def fix_cs(cs, warnings):
@@ -126,7 +147,7 @@ def main(src, dst, target, year):
         pdf_version = "1.4" if year == 2003 else "1.3"
         convert_icc = False
 
-    pdf = pikepdf.open(src)
+    pdf = pikepdf.open(io.BytesIO(read_input_bytes(src)))
     warnings = []
 
     # 1) remove transparency-group markers (page + forms)
@@ -203,29 +224,32 @@ def main(src, dst, target, year):
     # 6) clear stray Catalog /Version override, write correct version + classic xref
     if "/Version" in pdf.Root:
         del pdf.Root["/Version"]
-    pdf.save(dst, force_version=pdf_version,
+    save_pdf(pdf, dst, force_version=pdf_version,
              object_stream_mode=pikepdf.ObjectStreamMode.disable,
              fix_metadata_version=False)
     pdf.close()
 
-    print(f"Wrote {dst}  ->  {version_str}  (PDF {pdf_version})")
-    print(f"  - removed {groups_removed} transparency group marker(s)")
+    # When the PDF goes to stdout, log to stderr so it doesn't corrupt it.
+    log = sys.stderr if dst == "-" else sys.stdout
+    print(f"Wrote {'<stdout>' if dst == '-' else dst}  ->  {version_str}  "
+          f"(PDF {pdf_version})", file=log)
+    print(f"  - removed {groups_removed} transparency group marker(s)", file=log)
     if convert_icc:
-        print("  - relabelled ICC/CIE colour spaces to Device (X-1a)")
+        print("  - relabelled ICC/CIE colour spaces to Device (X-1a)", file=log)
     else:
-        print("  - colour spaces left untouched (ICC/CIE colour allowed in X-3)")
+        print("  - colour spaces left untouched (ICC/CIE colour allowed in X-3)", file=log)
     if warnings:
-        print("  WARNINGS:")
+        print("  WARNINGS:", file=log)
         for w in dict.fromkeys(warnings):  # de-dup, keep order
-            print("    -", w)
+            print("    -", w, file=log)
     else:
-        print("  - no transparency/colour warnings")
+        print("  - no transparency/colour warnings", file=log)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Finalize a flattened PDF as PDF/X-1a or PDF/X-3.")
-    ap.add_argument("input")
-    ap.add_argument("output")
+    ap.add_argument("input", help="input PDF, or - for stdin")
+    ap.add_argument("output", help="output PDF, or - for stdout")
     ap.add_argument("--target", required=True, choices=["x1a", "x3"],
                     help="x1a = PDF/X-1a:2001 (device CMYK); x3 = PDF/X-3 (colour-managed)")
     ap.add_argument("--year", type=int, choices=[2002, 2003], default=2003,
